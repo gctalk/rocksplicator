@@ -26,29 +26,41 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include <map>
 
 #include "boost/filesystem.hpp"
+#include "common/identical_name_thread_factory.h"
 #include "common/kafka/kafka_broker_file_watcher.h"
 #include "common/kafka/kafka_consumer_pool.h"
 #include "common/kafka/kafka_watcher.h"
 #include "common/network_util.h"
 #include "common/rocksdb_env_s3.h"
 #include "common/rocksdb_glogger/rocksdb_glogger.h"
+#include "common/segment_utils.h"
 #include "common/stats/stats.h"
 #include "common/thrift_router.h"
 #include "common/timer.h"
 #include "common/timeutil.h"
+#include "folly/futures/Future.h"
 #include "folly/FileUtil.h"
 #include "folly/MoveWrapper.h"
 #include "folly/ScopeGuard.h"
 #include "folly/String.h"
 #include "librdkafka/rdkafkacpp.h"
+#include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/utilities/backupable_db.h"
+#include "rocksdb/utilities/checkpoint.h"
 #include "rocksdb_admin/detail/kafka_broker_file_watcher_manager.h"
 #include "rocksdb_admin/utils.h"
 #include "rocksdb_replicator/rocksdb_replicator.h"
 #include "thrift/lib/cpp2/protocol/Serializer.h"
+#if __GNUC__ >= 8
+#include "folly/executors/CPUThreadPoolExecutor.h"
+#include "folly/system/ThreadName.h"
+#else
+#include "wangle/concurrent/CPUThreadPoolExecutor.h"
+#endif
 
 DEFINE_string(hdfs_name_node, "hdfs://hbasebak-infra-namenode-prod1c01-001:8020",
               "The hdfs name node used for backup");
@@ -59,7 +71,7 @@ DEFINE_string(rocksdb_dir, "/tmp/",
 DEFINE_int32(num_hdfs_access_threads, 8,
              "The number of threads for backup or restore to/from HDFS");
 
-DEFINE_int32(port, 9090, "Port of the server");
+DECLARE_int32(port);
 
 DEFINE_string(shard_config_path, "",
              "Local path of file storing shard mapping for Aperture");
@@ -89,10 +101,46 @@ DEFINE_int32(s3_download_limit_mb, 0, "S3 download sst bandwidth");
 DEFINE_int32(kafka_ts_update_interval, 1000, "Number of kafka messages consumed"
                                              " before updating meta_db");
 
-DEFINE_int32(consumer_log_frequency, 100, "only output one log in every "
-                                          "log_frequency of logs");
+DEFINE_bool(enable_logging_consumer_log, false,
+            "Enable logging consumer messages meta data at given log frequency");
+
+DEFINE_bool(enable_logging_consumer_log_with_payload, false,
+            "Enable logging consumer messages at given log frequency");
+
+DEFINE_int32(consumer_log_frequency, 100,
+  "only output one log in every log_frequency of logs");
 
 DECLARE_int32(kafka_consumer_timeout_ms);
+
+DEFINE_bool(enable_checkpoint_backup, false, "Enable backup via creating checkpoints");
+
+DEFINE_int32(checkpoint_backup_batch_num_upload, 1, "how many batches could be uploaded in paralell");
+
+DEFINE_int32(checkpoint_backup_batch_num_download, 1, "how many batches could be downloaded in paralell");
+
+DEFINE_int32(num_s3_upload_download_threads, 8,
+             "The number of threads for upload to/download from s3");
+
+DEFINE_int64(max_s3_upload_download_task_queue_size, 1000, "The queue size in the executor");
+
+DEFINE_bool(enable_async_delete_dbs, false, "Enable delete db files in async way");
+
+DEFINE_int32(async_delete_dbs_frequency_sec,
+             20,
+             "How frequently in sec to check the dbs need deleting in async way");
+DEFINE_int32(async_delete_dbs_wait_sec,
+             60,
+             "How long in sec to wait between the dbs deletion");
+
+#if __GNUC__ >= 8
+using folly::CPUThreadPoolExecutor;
+using folly::LifoSemMPMCQueue;
+using folly::QueueBehaviorIfFull;
+#else
+using wangle::CPUThreadPoolExecutor;
+using wangle::LifoSemMPMCQueue;
+using wangle::QueueBehaviorIfFull;
+#endif
 
 namespace {
 
@@ -124,6 +172,7 @@ const std::string kHDFSBackupMs = "hdfs_backup_ms";
 const std::string kHDFSRestoreMs = "hdfs_restore_ms";
 const std::string kS3BackupMs = "s3_backup_ms";
 const std::string kS3RestoreMs = "s3_restore_ms";
+const std::string kDeleteDBFailure = "delete_db_failure";
 
 int64_t GetMessageTimestampSecs(const RdKafka::Message& message) {
   const auto ts = message.timestamp();
@@ -221,7 +270,7 @@ std::unique_ptr<::admin::ApplicationDBManager> CreateDBBasedOnConfig(
         continue;
       }
 
-      auto db_name = admin::SegmentToDbName(segment.first.c_str(), shard_id);
+      auto db_name = common::SegmentToDbName(segment.first.c_str(), shard_id);
       auto options = rocksdb_options(segment.first);
       auto db_future = GetRocksdbFuture(FLAGS_rocksdb_dir + db_name, options);
       std::unique_ptr<folly::SocketAddress> upstream_addr(nullptr);
@@ -267,6 +316,16 @@ std::unique_ptr<::admin::ApplicationDBManager> CreateDBBasedOnConfig(
   }
 
   return db_manager;
+}
+
+template<typename T>
+void SetException(const std::string& message,
+                  const ::admin::AdminErrorCode code,
+                  std::unique_ptr<T>* callback) {
+  ::admin::AdminException e;
+  e.errorCode = code;
+  e.message = message;
+  callback->release()->exceptionInThread(std::move(e));
 }
 
 template<typename T>
@@ -333,6 +392,42 @@ bool DeserializeKafkaPayload(
   }
 }
 
+CPUThreadPoolExecutor* S3UploadAndDownloadExecutor() {
+  static CPUThreadPoolExecutor executor(
+      FLAGS_num_s3_upload_download_threads,
+      std::make_unique<LifoSemMPMCQueue<CPUThreadPoolExecutor::CPUTask>>(
+      FLAGS_max_s3_upload_download_task_queue_size),
+      std::make_shared<common::IdenticalNameThreadFactory>("s3-upload-download"));
+
+  return &executor;
+}
+
+// The dbs moved to db_tmp/ shouldnt be re-used or re-opened, so we can
+// delete them via boost filesystem operations rather than rocksdb::DestroyDB()
+void deleteTmpDBs() {
+  static const std::string db_tmp_path = FLAGS_rocksdb_dir + "db_tmp/";
+  boost::system::error_code dir_itr_err;
+  boost::filesystem::directory_iterator itr(db_tmp_path, dir_itr_err);
+  if (dir_itr_err) {
+    LOG(ERROR) << "Can't list files in db_tmp/:" << dir_itr_err.message();
+    return;
+  }
+  for (; itr != boost::filesystem::directory_iterator(); ++itr) {
+    if (itr->path().filename() == "." || itr->path().filename() == "..") {
+      continue;
+    }
+    boost::system::error_code remove_err;
+    boost::filesystem::remove_all(itr->path(), remove_err);
+    if (remove_err) {
+      common::Stats::get()->Incr(kDeleteDBFailure);
+      LOG(ERROR) << "Cant delete db: " << itr->path() << remove_err.message();
+    } else {
+      LOG(INFO) << "Done deleting db: " << itr->path();
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(FLAGS_async_delete_dbs_wait_sec));
+  }
+}
+
 }  // anonymous namespace
 
 namespace admin {
@@ -347,7 +442,8 @@ AdminHandler::AdminHandler(
   , s3_util_lock_()
   , meta_db_(OpenMetaDB())
   , allow_overlapping_keys_segments_()
-  , num_current_s3_sst_downloadings_(0) {
+  , num_current_s3_sst_downloadings_(0)
+  , stop_db_deletion_thread_(false) {
   if (db_manager_ == nullptr) {
     db_manager_ = CreateDBBasedOnConfig(rocksdb_options_);
   }
@@ -359,8 +455,39 @@ AdminHandler::AdminHandler(
   CHECK(FLAGS_max_s3_sst_loading_concurrency > 0)
     << "Invalid FLAGS_max_s3_sst_loading_concurrency: "
     << FLAGS_max_s3_sst_loading_concurrency;
+
+  if (FLAGS_enable_async_delete_dbs) {
+    static const std::string db_tmp_path = FLAGS_rocksdb_dir + "db_tmp/";
+    if (!boost::filesystem::exists(db_tmp_path)) {
+      boost::system::error_code create_err;
+      boost::filesystem::create_directories(db_tmp_path, create_err);
+      if (create_err) {
+        LOG(ERROR) << "Failed to create dir: " << db_tmp_path << create_err.message();
+        return;
+      }
+    }
+
+    db_deletion_thread_ = std::make_unique<std::thread>([this] {
+      if (!folly::setThreadName("DBDeleter")) {
+        LOG(ERROR) << "Failed to set thread name for DB deletion thread";
+      }
+
+      LOG(INFO) << "Starting DB deletion thread ...";
+      while (!stop_db_deletion_thread_.load()) {
+        deleteTmpDBs();
+        std::this_thread::sleep_for(std::chrono::seconds(FLAGS_async_delete_dbs_frequency_sec));
+      }
+      LOG(INFO) << "Stopping DB deletioin thread ...";
+    });
+  }
 }
 
+AdminHandler::~AdminHandler() {
+  if (FLAGS_enable_async_delete_dbs) {
+    stop_db_deletion_thread_ = true;
+    db_deletion_thread_->join();
+  }
+}
 
 std::shared_ptr<ApplicationDB> AdminHandler::getDB(
     const std::string& db_name,
@@ -454,7 +581,7 @@ void AdminHandler::async_tm_addDB(
     return;
   }
 
-  auto segment = admin::DbNameToSegment(request->db_name);
+  auto segment = common::DbNameToSegment(request->db_name);
   auto db_path = FLAGS_rocksdb_dir + request->db_name;
   rocksdb::Status status;
   if (request->overwrite) {
@@ -484,7 +611,7 @@ void AdminHandler::async_tm_addDB(
   std::string err_msg;
   replicator::DBRole role = replicator::DBRole::SLAVE;
   if (request->__isset.db_role) {
-    if (request->db_role == "SLAVE") {
+    if (request->db_role == "SLAVE" || request->db_role == "FOLLOWER") {
       role = replicator::DBRole::SLAVE;
     } else if (request->db_role == "NOOP") {
       role = replicator::DBRole::NOOP;
@@ -492,6 +619,21 @@ void AdminHandler::async_tm_addDB(
       e.errorCode = AdminErrorCode::INVALID_DB_ROLE;
       e.message = std::move(request->db_role);
       callback.release()->exceptionInThread(std::move(e));
+      return;
+    }
+  }
+
+  // update meta if not exist
+  auto meta = getMetaData(request->db_name);
+  if (!meta.__isset.s3_bucket && !meta.__isset.s3_path &&
+      !meta.__isset.last_kafka_msg_timestamp_ms) {
+    LOG(INFO) << "No preivous meta exist, write a fresh meta to metadb for db: "
+              << request->db_name;
+    if (!writeMetaData(request->db_name, "", "")) {
+      std::string errMsg =
+          "AddDB failed to write initial DBMetaData for " + request->db_name;
+      SetException(errMsg, admin::AdminErrorCode::DB_ADMIN_ERROR, &callback);
+      LOG(ERROR) << errMsg;
       return;
     }
   }
@@ -518,6 +660,8 @@ bool AdminHandler::backupDBHelper(const std::string& db_name,
                                   std::unique_ptr<rocksdb::Env> env_holder,
                                   const bool enable_backup_rate_limit,
                                   const uint32_t backup_rate_limit,
+                                  const bool share_files_with_checksum,
+                                  bool include_meta,
                                   AdminException* e) {
   CHECK(env_holder != nullptr);
   db_admin_lock_.Lock(db_name);
@@ -530,6 +674,9 @@ bool AdminHandler::backupDBHelper(const std::string& db_name,
   }
 
   rocksdb::BackupableDBOptions options(backup_dir);
+  if (share_files_with_checksum) {
+    options.share_files_with_checksum = true;
+  }
   common::RocksdbGLogger logger;
   options.info_log = &logger;
   options.max_background_operations = FLAGS_num_hdfs_access_threads;
@@ -549,7 +696,20 @@ bool AdminHandler::backupDBHelper(const std::string& db_name,
   }
   std::unique_ptr<rocksdb::BackupEngine> backup_engine_holder(backup_engine);
 
-  return backup_engine->CreateNewBackup(db->rocksdb()).ok();
+  if (include_meta) {
+    std::string db_meta;
+    const auto meta = getMetaData(db_name);
+    if (!EncodeThriftStruct(meta, &db_meta)) {
+      e->errorCode = AdminErrorCode::DB_ADMIN_ERROR;
+      e->message = "Failed to encode DBMetaData";
+      return false;
+    } else {
+      LOG(INFO) << "Create new backup with encoded meta: " << db_meta;
+      return backup_engine->CreateNewBackupWithMetadata(db->rocksdb(), db_meta).ok();
+    }
+  } else {
+    return backup_engine->CreateNewBackup(db->rocksdb()).ok();
+  }  
 }
 
 bool AdminHandler::restoreDBHelper(const std::string& db_name,
@@ -590,8 +750,20 @@ bool AdminHandler::restoreDBHelper(const std::string& db_name,
   }
   std::unique_ptr<rocksdb::BackupEngine> backup_engine_holder(backup_engine);
 
+  std::vector<rocksdb::BackupInfo> backup_infos;
+  backup_engine->GetBackupInfo(&backup_infos);
+  if (backup_infos.size() < 1) {
+    e->errorCode = AdminErrorCode::DB_NOT_FOUND;
+    e->message = "Failed to getBackupInfo with backupEngine";
+    return false;
+  }
+  std::sort(backup_infos.begin(), backup_infos.end(), [](rocksdb::BackupInfo& a, rocksdb::BackupInfo& b) {
+    return a.backup_id < b.backup_id;
+  });
+  uint32_t latest_backup_id = backup_infos.back().backup_id;
+
   auto db_path = FLAGS_rocksdb_dir + db_name;
-  status = backup_engine->RestoreDBFromLatestBackup(db_path, db_path);
+  status = backup_engine->RestoreDBFromBackup(latest_backup_id, db_path, db_path);
   if (!status.ok()) {
     e->errorCode = AdminErrorCode::DB_ADMIN_ERROR;
     e->message = status.ToString();
@@ -599,11 +771,26 @@ bool AdminHandler::restoreDBHelper(const std::string& db_name,
   }
 
   rocksdb::DB* rocksdb_db;
-  auto segment = admin::DbNameToSegment(db_name);
+  auto segment = common::DbNameToSegment(db_name);
   status = rocksdb::DB::Open(rocksdb_options_(segment), db_path, &rocksdb_db);
   if (!status.ok()) {
     e->errorCode = AdminErrorCode::DB_ERROR;
     e->message = status.ToString();
+    return false;
+  }
+
+  DBMetaData meta;
+  const std::string& meta_from_backup = backup_infos.back().app_metadata;
+  LOG(INFO) << "Get backupInfo.app_metadata:" << meta_from_backup << " from backupId: " << std::to_string(latest_backup_id);
+  if (!meta_from_backup.empty() && !DecodeThriftStruct(meta_from_backup, &meta)) {
+      e->errorCode = AdminErrorCode::DB_ERROR;
+      e->message = "Failed to decode DBMetaData";
+      return false;
+  } 
+  meta.set_db_name(db_name);
+  if (!writeMetaData(meta.db_name, meta.s3_bucket, meta.s3_path)) {
+    e->errorCode = AdminErrorCode::DB_ADMIN_ERROR;
+    e->message = "RestoreDBHelper failed to write DBMetaData from restore's app_metadata for " + meta.db_name;
     return false;
   }
 
@@ -636,11 +823,15 @@ void AdminHandler::async_tm_backupDB(
   common::Timer timer(kHDFSBackupMs);
   LOG(INFO) << "HDFS Backup " << request->db_name << " to " << full_path;
   AdminException e;
+  const bool share_files_with_checksum = request->__isset.share_files_with_checksum && request->share_files_with_checksum;
+  const bool include_meta = request->__isset.include_meta && request->include_meta;
   if (!backupDBHelper(request->db_name,
                       full_path,
                       std::unique_ptr<rocksdb::Env>(hdfs_env),
                       request->__isset.limit_mbs,
                       request->limit_mbs,
+                      share_files_with_checksum,
+                      include_meta,
                       &e)) {
     callback.release()->exceptionInThread(std::move(e));
     common::Stats::get()->Incr(kHDFSBackupFailure);
@@ -703,6 +894,13 @@ inline std::string rtrim(std::string str, char c) {
   return str;
 }
 
+inline std::string ensure_ends_with_pathsep(const std::string& s) {
+  if (!s.empty() && s.back() != '/') {
+    return s + "/";
+  }
+  return s;
+}
+
 void AdminHandler::async_tm_backupDBToS3(
     std::unique_ptr<apache::thrift::HandlerCallback<std::unique_ptr<
       BackupDBToS3Response>>> callback,
@@ -717,46 +915,161 @@ void AdminHandler::async_tm_backupDBToS3(
     auto err_str =
         folly::stringPrintf("Concurrent uploading/downloading limit hits %d by %s",
                             n, request->db_name.c_str());
-
-    e.message = err_str;
-    callback.release()->exceptionInThread(std::move(e));
+    SetException(err_str, AdminErrorCode::DB_ADMIN_ERROR, &callback);
     LOG(ERROR) << err_str;
     common::Stats::get()->Incr(kS3BackupFailure);
     return;
   }
 
-  auto local_path = FLAGS_rocksdb_dir + "s3_tmp/" + request->db_name + "/";
+  common::Timer timer(kS3BackupMs);
+  LOG(INFO) << "S3 Backup " << request->db_name << " to " << request->s3_backup_dir;
+  auto ts = common::timeutil::GetCurrentTimestamp();
+  auto local_path = folly::stringPrintf("%ss3_tmp/%s%d/", FLAGS_rocksdb_dir.c_str(), request->db_name.c_str(), ts);
   boost::system::error_code remove_err;
   boost::system::error_code create_err;
   boost::filesystem::remove_all(local_path, remove_err);
   boost::filesystem::create_directories(local_path, create_err);
   SCOPE_EXIT { boost::filesystem::remove_all(local_path, remove_err); };
   if (remove_err || create_err) {
-    e.errorCode = AdminErrorCode::DB_ADMIN_ERROR;
-    e.message = "Cannot remove/create dir: " + local_path;
-    callback.release()->exceptionInThread(std::move(e));
+    SetException("Cannot remove/create dir for backup: " + local_path, AdminErrorCode::DB_ADMIN_ERROR, &callback);
     common::Stats::get()->Incr(kS3BackupFailure);
     return;
   }
 
-  common::Timer timer(kS3BackupMs);
-  auto local_s3_util = createLocalS3Util(request->limit_mbs, request->s3_bucket);
-  std::string formatted_s3_dir_path = rtrim(request->s3_backup_dir, '/');
-  rocksdb::Env* s3_env = new rocksdb::S3Env(formatted_s3_dir_path, local_path, std::move(local_s3_util));
+  if (FLAGS_enable_checkpoint_backup) {
+    db_admin_lock_.Lock(request->db_name);
+    SCOPE_EXIT { db_admin_lock_.Unlock(request->db_name); };
 
-  LOG(INFO) << "S3 Backup " << request->db_name << " to " << formatted_s3_dir_path;
-  if (!backupDBHelper(request->db_name,
-                      formatted_s3_dir_path,
-                      std::unique_ptr<rocksdb::Env>(s3_env),
-                      request->__isset.limit_mbs,
-                      request->limit_mbs,
-                      &e)) {
-    callback.release()->exceptionInThread(std::move(e));
-    common::Stats::get()->Incr(kS3BackupFailure);
-    return;
+    auto db = getDB(request->db_name, &e);
+    if (db == nullptr) {
+      LOG(ERROR) << "Error happened when getting db for creating checkpoint: " << e.message;
+      callback.release()->exceptionInThread(std::move(e));
+      common::Stats::get()->Incr(kS3BackupFailure);
+      return;
+    }
+
+    rocksdb::Checkpoint* checkpoint;
+    auto status = rocksdb::Checkpoint::Create(db->rocksdb(), &checkpoint);
+    if (!status.ok()) {
+      OKOrSetException(status, AdminErrorCode::DB_ADMIN_ERROR, &callback);
+      LOG(ERROR) << "Error happened when trying to initialize checkpoint: " << status.ToString();
+      common::Stats::get()->Incr(kS3BackupFailure);
+      return;
+    }
+
+    auto checkpoint_local_path = local_path + "checkpoint";
+    status = checkpoint->CreateCheckpoint(checkpoint_local_path);
+    if (!status.ok()) {
+      OKOrSetException(status, AdminErrorCode::DB_ADMIN_ERROR, &callback);
+      LOG(ERROR) << "Error happened when trying to create checkpoint: " << status.ToString();
+      common::Stats::get()->Incr(kS3BackupFailure);
+      return;
+    }
+    std::unique_ptr<rocksdb::Checkpoint> checkpoint_holder(checkpoint);
+
+    std::vector<std::string> checkpoint_files;
+    status = rocksdb::Env::Default()->GetChildren(checkpoint_local_path, &checkpoint_files);
+    if (!status.ok()) {
+      OKOrSetException(status, AdminErrorCode::DB_ADMIN_ERROR, &callback);
+      LOG(ERROR) << "Error happened when trying to list files in the checkpoint: " << status.ToString();
+      common::Stats::get()->Incr(kS3BackupFailure);
+      return;
+    }
+
+    // Upload checkpoint to s3
+    auto local_s3_util = createLocalS3Util(request->limit_mbs, request->s3_bucket);
+    std::string formatted_s3_dir_path = ensure_ends_with_pathsep(request->s3_backup_dir);
+    std::string formatted_checkpoint_local_path = ensure_ends_with_pathsep(checkpoint_local_path);
+    auto upload_func = [&](const std::string& dest, const std::string& source) {
+      LOG(INFO) << "Copying " << source << " to " << dest;
+      auto copy_resp = local_s3_util->putObject(dest, source);
+      if (!copy_resp.Error().empty()) {
+        LOG(ERROR)
+            << "Error happened when uploading files from checkpoint to S3: "
+            << copy_resp.Error();
+        return false;
+      }
+      return true;
+    };
+
+    if (FLAGS_checkpoint_backup_batch_num_upload > 1) {
+      // Upload checkpoint files to s3 in parallel
+      std::vector<std::vector<std::string>> file_batches(FLAGS_checkpoint_backup_batch_num_upload);
+      for (size_t i = 0; i < checkpoint_files.size(); ++i) {
+        auto& file = checkpoint_files[i];
+        if (file == "." || file == "..") {
+          continue;
+        }
+        file_batches[i%FLAGS_checkpoint_backup_batch_num_upload].push_back(file);
+      }
+
+      std::vector<folly::Future<bool>> futures;
+      for (auto& files : file_batches) {
+        auto p = folly::Promise<bool>();
+        futures.push_back(p.getFuture());
+
+        S3UploadAndDownloadExecutor()->add(
+            [&, files = std::move(files), p = std::move(p)]() mutable {
+              for (const auto& file : files) {
+                if (!upload_func(formatted_s3_dir_path + file, formatted_checkpoint_local_path + file)) {
+                  p.setValue(false);
+                  return;
+                }
+              }
+              p.setValue(true);
+            });
+      }
+
+      for (auto& f : futures) {
+        auto res = std::move(f).get();
+        if (!res) {
+          SetException("Error happened when uploading files from checkpoint to S3",
+                       AdminErrorCode::DB_ADMIN_ERROR,
+                       &callback);
+          common::Stats::get()->Incr(kS3BackupFailure);
+          return;
+        }
+      }
+    } else {
+      for (const auto& file : checkpoint_files) {
+        if (file == "." || file == "..") {
+          continue;
+        }
+        if (!upload_func(formatted_s3_dir_path + file, formatted_checkpoint_local_path + file)) {
+          // If there is error in one file uploading, then we fail the whole backup process
+          SetException("Error happened when uploading files from checkpoint to S3",
+                       AdminErrorCode::DB_ADMIN_ERROR,
+                       &callback);
+          common::Stats::get()->Incr(kS3BackupFailure);
+          return;
+        }
+      }
+    }
+
+    // Delete the directory to remove the snapshot.
+    boost::filesystem::remove_all(local_path);
+  } else {
+    auto local_s3_util = createLocalS3Util(request->limit_mbs, request->s3_bucket);
+    std::string formatted_s3_dir_path = rtrim(request->s3_backup_dir, '/');
+    rocksdb::Env* s3_env = new rocksdb::S3Env(formatted_s3_dir_path, local_path, std::move(local_s3_util));
+    const bool share_files_with_checksum = request->__isset.share_files_with_checksum && request->share_files_with_checksum;
+    const bool include_meta = request->__isset.include_meta && request->include_meta;
+    if (!backupDBHelper(request->db_name,
+                        formatted_s3_dir_path,
+                        std::unique_ptr<rocksdb::Env>(s3_env),
+                        request->__isset.limit_mbs,
+                        request->limit_mbs,
+                        share_files_with_checksum,
+                        include_meta,
+                        &e)) {
+      callback.release()->exceptionInThread(std::move(e));
+      common::Stats::get()->Incr(kS3BackupFailure);
+      return;
+    }
   }
 
-  LOG(INFO) << "S3 Backup is done.";
+  LOG(INFO) << "S3 Backup is done for " << request->db_name
+            << " with latency(ms) " << timer.getElapsedTimeMs();
   common::Stats::get()->Incr(kS3BackupSuccess);
   callback->result(BackupDBToS3Response());
 }
@@ -775,24 +1088,26 @@ void AdminHandler::async_tm_restoreDBFromS3(
     auto err_str =
         folly::stringPrintf("Concurrent uploading/downloading limit hits %d by %s",
                             n, request->db_name.c_str());
-
-    e.message = err_str;
-    callback.release()->exceptionInThread(std::move(e));
+    SetException(err_str, AdminErrorCode::DB_ADMIN_ERROR, &callback);
     LOG(ERROR) << err_str;
     common::Stats::get()->Incr(kS3RestoreFailure);
     return;
   }
 
-  auto local_path = FLAGS_rocksdb_dir + "s3_tmp/" + request->db_name + "/";
+  auto ts = common::timeutil::GetCurrentTimestamp();
+  auto local_path = FLAGS_enable_checkpoint_backup ? FLAGS_rocksdb_dir + request->db_name :
+                    folly::stringPrintf("%ss3_tmp/%s%d/", FLAGS_rocksdb_dir.c_str(), request->db_name.c_str(), ts);
   boost::system::error_code remove_err;
   boost::system::error_code create_err;
   boost::filesystem::remove_all(local_path, remove_err);
   boost::filesystem::create_directories(local_path, create_err);
-  SCOPE_EXIT { boost::filesystem::remove_all(local_path, remove_err); };
+  SCOPE_EXIT {
+    if (!FLAGS_enable_checkpoint_backup) {
+      boost::filesystem::remove_all(local_path, remove_err);
+    }
+  };
   if (remove_err || create_err) {
-    e.errorCode = AdminErrorCode::DB_ADMIN_ERROR;
-    e.message = "Cannot remove/create dir: " + local_path;
-    callback.release()->exceptionInThread(std::move(e));
+    SetException("Cannot remove/create dir for restore: " + local_path, AdminErrorCode::DB_ADMIN_ERROR, &callback);
     common::Stats::get()->Incr(kS3RestoreFailure);
     return;
   }
@@ -807,25 +1122,135 @@ void AdminHandler::async_tm_restoreDBFromS3(
   }
 
   common::Timer timer(kS3RestoreMs);
+  LOG(INFO) << "S3 Restore " << request->db_name << " from " << request->s3_backup_dir;
   auto local_s3_util = createLocalS3Util(request->limit_mbs, request->s3_bucket);
-  std::string formatted_s3_dir_path = rtrim(request->s3_backup_dir, '/');
-  rocksdb::Env* s3_env = new rocksdb::S3Env(
-  formatted_s3_dir_path, std::move(local_path), std::move(local_s3_util));
 
-  LOG(INFO) << "S3 Restore " << request->db_name << " from " << formatted_s3_dir_path;
-  if (!restoreDBHelper(request->db_name,
-                       formatted_s3_dir_path,
-                       std::unique_ptr<rocksdb::Env>(s3_env),
-                       std::move(upstream_addr),
-                       request->__isset.limit_mbs,
-                       request->limit_mbs,
-                       &e)) {
-    callback.release()->exceptionInThread(std::move(e));
-    common::Stats::get()->Incr(kS3RestoreFailure);
-    return;
+  if (FLAGS_enable_checkpoint_backup) {
+    std::string formatted_s3_dir_path = ensure_ends_with_pathsep(request->s3_backup_dir);
+    std::string formatted_local_path = ensure_ends_with_pathsep(local_path);
+    // fetch all files using the given path as the key prefix in S3
+    auto resp = local_s3_util->listAllObjects(formatted_s3_dir_path);
+    if (!resp.Error().empty()) {
+      auto err_msg = folly::stringPrintf(
+          "Error happened when fetching files in checkpoint from S3: %s under path: %s",
+          resp.Error().c_str(), formatted_s3_dir_path.c_str());
+      LOG(ERROR) << err_msg;
+      SetException(err_msg, AdminErrorCode::DB_ADMIN_ERROR, &callback);
+      common::Stats::get()->Incr(kS3RestoreFailure);
+      return;
+    }
+
+    auto download_func = [&](const std::string& s3_path) {
+      const string dest =
+          formatted_local_path + s3_path.substr(formatted_s3_dir_path.size());
+      LOG(INFO) << "Copying " << s3_path << " to " << dest;
+      auto get_resp =
+          local_s3_util->getObject(s3_path, dest, FLAGS_s3_direct_io);
+      if (!get_resp.Error().empty()) {
+        LOG(ERROR) << "Error happened when downloading the file in checkpoint "
+                      "from S3 to local: "
+                   << get_resp.Error();
+        return false;
+      }
+      return true;
+    };
+
+    if (FLAGS_checkpoint_backup_batch_num_download> 1) {
+      // Download checkpoint files to s3 in parallel
+      std::vector<std::vector<std::string>> file_batches(FLAGS_checkpoint_backup_batch_num_download);
+      for (size_t i = 0; i < resp.Body().objects.size(); ++i) {
+        file_batches[i%FLAGS_checkpoint_backup_batch_num_download].push_back(resp.Body().objects[i]);
+      }
+
+      std::vector<folly::Future<bool>> futures;
+      for (auto& files : file_batches) {
+        auto p = folly::Promise<bool>();
+        futures.push_back(p.getFuture());
+
+        S3UploadAndDownloadExecutor()->add(
+            [&, files = std::move(files), p = std::move(p)]() mutable {
+              for (const auto& file : files) {
+                if (!download_func(file)) {
+                  p.setValue(false);
+                  return;
+                }
+              }
+              p.setValue(true);
+            });
+      }
+
+      for (auto& f : futures) {
+        auto res = std::move(f).get();
+        if (!res) {
+          SetException("Error happened when downloading the file in checkpoint from S3 to local",
+                       AdminErrorCode::DB_ADMIN_ERROR,
+                       &callback);
+          common::Stats::get()->Incr(kS3RestoreFailure);
+          return;
+        }
+      }
+    } else {
+      for (auto& v : resp.Body().objects) {
+        if (!download_func(v)) {
+          // If there is error in one file uploading, then we fail the whole backup process
+          SetException("Error happened when downloading the file in checkpoint from S3 to local",
+                       AdminErrorCode::DB_ADMIN_ERROR,
+                       &callback);
+          common::Stats::get()->Incr(kS3RestoreFailure);
+          return;
+        }
+      }
+    }
+
+
+    rocksdb::DB* restore_db;
+    auto segment = common::DbNameToSegment(request->db_name);
+    auto status = rocksdb::DB::Open(rocksdb_options_(segment), formatted_local_path, &restore_db);
+    if (!status.ok()) {
+      OKOrSetException(status, AdminErrorCode::DB_ERROR, &callback);
+      LOG(ERROR) << "Error happened when opening db via checkpoint: " << status.ToString();
+      common::Stats::get()->Incr(kS3RestoreFailure);
+      return;
+    }
+
+    if (!writeMetaData(request->db_name, "", "")) {
+      // TODO: enable backup with meta for checkpoint, then, restore will writ the meta from the backup
+      std::string errMsg = "RestoreDBFromS3 failed to write DBMetaData for " + request->db_name;
+      SetException(errMsg, AdminErrorCode::DB_ADMIN_ERROR, &callback);
+      common::Stats::get()->Incr(kS3RestoreFailure);
+      return;
+    }
+
+    std::string err_msg;
+    if (!db_manager_->addDB(request->db_name,
+                            std::unique_ptr<rocksdb::DB>(restore_db),
+                            replicator::DBRole::SLAVE,
+                            std::move(upstream_addr), &err_msg)) {
+      LOG(ERROR) << "Error happened when adding db after restore by checkpoint: " << err_msg;
+      SetException(err_msg, AdminErrorCode::DB_ADMIN_ERROR, &callback);
+      common::Stats::get()->Incr(kS3RestoreFailure);
+      return;
+    }
+  } else {
+    std::string formatted_s3_dir_path = rtrim(request->s3_backup_dir, '/');
+    rocksdb::Env* s3_env = new rocksdb::S3Env(
+        formatted_s3_dir_path, std::move(local_path), std::move(local_s3_util));
+
+    if (!restoreDBHelper(request->db_name,
+                         formatted_s3_dir_path,
+                         std::unique_ptr<rocksdb::Env>(s3_env),
+                         std::move(upstream_addr),
+                         request->__isset.limit_mbs,
+                         request->limit_mbs,
+                         &e)) {
+      callback.release()->exceptionInThread(std::move(e));
+      common::Stats::get()->Incr(kS3RestoreFailure);
+      return;
+    }
   }
 
-  LOG(INFO) << "Restore is done.";
+  LOG(INFO) << "S3 Restore is done for " << request->db_name
+            << " with latency(ms) " << timer.getElapsedTimeMs();
   callback->result(RestoreDBFromS3Response());
   common::Stats::get()->Incr(kS3RestoreSuccess);
 }
@@ -861,6 +1286,42 @@ void AdminHandler::async_tm_checkDB(
     }
   }
 
+  if (request->__isset.option_names && !request->option_names.empty()) {
+    std::map<std::string, std::string> options_map;
+    auto s = db->GetOptions(request->option_names, &options_map);
+    if (s.ok()) {
+      response.options = options_map;
+      response.__isset.options = true;
+    } else {
+      LOG(ERROR) << "Failed to GetOptions from db, " << s.ToString();
+    }
+  }
+
+  if (request->__isset.include_meta) {
+    auto meta = getMetaData(request->db_name);
+    std::map<std::string, std::string> metas;
+    metas["s3_bucket"] = meta.s3_bucket;
+    metas["s3_path"] = meta.s3_path;
+    metas["last_kafka_msg_timestamp_ms"] =
+        std::to_string(meta.last_kafka_msg_timestamp_ms);
+    response.db_metas = metas;
+    response.__isset.db_metas = true;
+  }
+
+  if (request->__isset.property_names && !request->property_names.empty()) {
+    std::map<std::string, std::string> properties;
+    for (const auto& p : request->property_names) {
+      std::string p_val;
+      if (db->GetProperty(p, &p_val)) {
+        properties[p] = p_val;
+      } else {
+        LOG(ERROR) << "Failed to getProperty for " << p;
+      }
+    }
+    response.properties = properties;
+    response.__isset.properties = true;
+  }
+
   callback->result(response);
 }
 
@@ -889,9 +1350,9 @@ void AdminHandler::async_tm_changeDBRoleAndUpStream(
 
   AdminException e;
   replicator::DBRole new_role;
-  if (request->new_role == "MASTER") {
+  if (request->new_role == "MASTER" || request->new_role == "LEADER") {
     new_role = replicator::DBRole::MASTER;
-  } else if (request->new_role == "SLAVE") {
+  } else if (request->new_role == "SLAVE" || request->new_role == "FOLLOWER") {
     new_role = replicator::DBRole::SLAVE;
   } else {
     e.errorCode = AdminErrorCode::INVALID_DB_ROLE;
@@ -972,19 +1433,41 @@ void AdminHandler::async_tm_clearDB(
 
   removeDB(request->db_name, nullptr);
 
-  auto options = rocksdb_options_(admin::DbNameToSegment(request->db_name));
+  auto options = rocksdb_options_(common::DbNameToSegment(request->db_name));
   auto db_path = FLAGS_rocksdb_dir + request->db_name;
   LOG(INFO) << "Clearing DB: " << request->db_name;
   clearMetaData(request->db_name);
-  auto status = rocksdb::DestroyDB(db_path, options);
-  if (!OKOrSetException(status,
-                        AdminErrorCode::DB_ADMIN_ERROR,
-                        &callback)) {
-    LOG(ERROR) << "Failed to clear DB " << request->db_name << " "
-               << status.ToString();
-    return;
+
+  if (FLAGS_enable_async_delete_dbs) {
+    // Move db to db_tmp/ to be cleared in the async way
+    auto db_tmp_path = FLAGS_rocksdb_dir + "db_tmp/" + request->db_name + "/";
+    boost::system::error_code rename_err;
+    boost::filesystem::rename(db_path, db_tmp_path, rename_err);
+    if (rename_err) {
+      admin::AdminException e;
+      e.errorCode = AdminErrorCode::DB_ADMIN_ERROR;
+      e.message = folly::stringPrintf("Cannot mv db: %s to %s: %s",
+                                      db_path.c_str(),
+                                      db_tmp_path.c_str(),
+                                      rename_err.message().c_str());
+      LOG(ERROR) << e.message ;
+      callback.release()->exceptionInThread(std::move(e));
+      return;
+    }
+
+    LOG(INFO) << "Delay clearing DB: " << request->db_name;
+  } else {
+    auto status = rocksdb::DestroyDB(db_path, options);
+    if (!OKOrSetException(status,
+                          AdminErrorCode::DB_ADMIN_ERROR,
+                          &callback)) {
+      LOG(ERROR) << "Failed to clear DB " << request->db_name << " "
+                 << status.ToString();
+      return;
+    }
+
+    LOG(INFO) << "Done clearing DB: " << request->db_name;
   }
-  LOG(INFO) << "Done clearing DB: " << request->db_name;
 
   if (request->reopen_db && need_to_reopen) {
     LOG(INFO) << "Open DB: " << request->db_name;
@@ -993,6 +1476,12 @@ void AdminHandler::async_tm_clearDB(
     auto db = GetRocksdb(db_path, options);
     if (db == nullptr) {
       e.message = "Failed to open DB: " + request->db_name;
+      callback.release()->exceptionInThread(std::move(e));
+      return;
+    }
+
+    if (!writeMetaData(request->db_name, "", "")) {
+      e.message = "ClearDB with reopen failed to write initial DBMetaData for " + request->db_name;
       callback.release()->exceptionInThread(std::move(e));
       return;
     }
@@ -1046,6 +1535,9 @@ std::shared_ptr<common::S3Util> AdminHandler::createLocalS3Util(
   return local_s3_util;
 }
 
+// This API is used to ingest sst files to DB with two models: ingest ahead or ingest behind.
+// It will check local metaData to avoid duplicate ingestion. If ingest_behind, DB's Lmax
+// must also be emtpy and DB must created with allow_ingest_behind. 
 void AdminHandler::async_tm_addS3SstFilesToDB(
     std::unique_ptr<apache::thrift::HandlerCallback<std::unique_ptr<
       AddS3SstFilesToDBResponse>>> callback,
@@ -1065,12 +1557,39 @@ void AdminHandler::async_tm_addS3SstFilesToDB(
     return;
   }
 
+  // it is important to check meta first to avoid double ingestion
   auto meta = getMetaData(request->db_name);
   if (meta.__isset.s3_bucket && meta.s3_bucket == request->s3_bucket &&
       meta.__isset.s3_path && meta.s3_path == request->s3_path) {
     LOG(INFO) << "Already hosting " << meta.s3_bucket << "/" << meta.s3_path;
     callback->result(AddS3SstFilesToDBResponse());
     return;
+  } else {
+    LOG(INFO) << folly::stringPrintf(
+        "Current meta, s3_bucket: %s, s3_path: %s. Update with, s3_bucket: %s, "
+        "s3_path: %s",
+        meta.s3_bucket.c_str(), meta.s3_path.c_str(),
+        request->s3_bucket.c_str(), request->s3_path.c_str());
+  }
+
+  bool ingest_behind = request->__isset.ingest_behind && request->ingest_behind;
+  if (ingest_behind) {
+    if (!db->rocksdb()->GetDBOptions().allow_ingest_behind) {
+      e.message = request->db_name + " DBOptions.allow_ingest_behind false";
+      LOG(ERROR) << "DBOptions.allow_ingest_behind false, can't ingest behind "
+                 << request->db_name;
+      callback.release()->exceptionInThread(std::move(e));
+      return;
+    }
+    if (!db->DBLmaxEmpty()) {
+      // note: default num levels for DB is 7 (0, 1, ..., 6)
+      std::string errMsg =
+          "The Lmax of DB is not empty, skip ingestion to " + request->db_name;
+      e.message = errMsg;
+      callback.release()->exceptionInThread(std::move(e));
+      LOG(ERROR) << errMsg;
+      return;
+    }
   }
 
   // The local data is not the latest, so we need to download the latest data
@@ -1149,11 +1668,13 @@ void AdminHandler::async_tm_addS3SstFilesToDB(
 
   clearMetaData(request->db_name);
 
-  auto segment = admin::DbNameToSegment(request->db_name);
+  auto segment = common::DbNameToSegment(request->db_name);
   bool allow_overlapping_keys =
       allow_overlapping_keys_segments_.find(segment) !=
       allow_overlapping_keys_segments_.end();
   // OR with the flag to make backwards compatibility
+  // It is very important to allow overlapping keys if ingest to an existing DB,
+  // and do not intend to clear the existing data
   allow_overlapping_keys =
       allow_overlapping_keys || FLAGS_rocksdb_allow_overlapping_keys;
   if (!allow_overlapping_keys) {
@@ -1206,6 +1727,9 @@ void AdminHandler::async_tm_addS3SstFilesToDB(
   /* if true, rocksdb will allow for overlapping keys */
   ifo.allow_global_seqno = allow_overlapping_keys;
   ifo.allow_blocking_flush = allow_overlapping_keys;
+  if (ingest_behind) {
+    ifo.ingest_behind = true;
+  }
   auto status = db->rocksdb()->IngestExternalFile(sst_file_paths, ifo);
   if (!OKOrSetException(status,
                         AdminErrorCode::DB_ADMIN_ERROR,
@@ -1215,8 +1739,15 @@ void AdminHandler::async_tm_addS3SstFilesToDB(
     return;
   }
 
-  writeMetaData(request->db_name, request->s3_bucket, request->s3_path);
+  if (!writeMetaData(request->db_name, request->s3_bucket, request->s3_path)) {
+    std::string errMsg = "AddS3SstFilesToDB failed to write DBMetaData from request for " + request->db_name;
+    SetException(errMsg, AdminErrorCode::DB_ADMIN_ERROR, &callback);
+    LOG(ERROR) << errMsg;
+    return;
+  }
+  
 
+  // attention: no compaction during backfill to prevent removing deletion tombstone
   if (FLAGS_compact_db_after_load_sst) {
     auto status = db->rocksdb()->CompactRange(nullptr, nullptr);
     if (!status.ok()) {
@@ -1267,17 +1798,19 @@ void AdminHandler::async_tm_startMessageIngestion(
     std::lock_guard<std::mutex> lock(kafka_watcher_lock_);
     // Check if there's already a thread consuming the same partition.
     if (kafka_watcher_map_.find(db_name) != kafka_watcher_map_.end()) {
-      e.message = db_name + " is already being consumed";
-      callback.release()->exceptionInThread(std::move(e));
+      // This can happen if there are duplicate state transition messages from helix.
+      // Since there is aleady a thread consuming kafka messages for this db,
+      // just log and return.
       LOG(ERROR) << "Already consuming messages to " << db_name <<
                  "in another thread";
+      callback.release()->result(StartMessageIngestionResponse());
       return;
     }
   }
 
   // Kafka partition to consume is the shard id in rocksdb.
-  const auto segment = DbNameToSegment(db_name);
-  const auto partition_id = ExtractShardId(db_name);
+  const auto segment = common::DbNameToSegment(db_name);
+  const auto partition_id = common::ExtractShardId(db_name);
 
   if (partition_id == -1) {
     e.message = "Invalid db_name: " + db_name;
@@ -1331,19 +1864,25 @@ void AdminHandler::async_tm_startMessageIngestion(
     const int64_t msg_timestamp_secs = GetMessageTimestampSecs(*message);
     message_count++;
 
-    // Logs for debugging
-    LOG_EVERY_N(INFO, FLAGS_consumer_log_frequency)
+    // Logs for debugging, only enabled if flag is specified.
+    // In case of sensitive data... we shouldn't be logging message, unless
+    // explicitly configured to do so (may be in order to debug)
+    if (FLAGS_enable_logging_consumer_log) {
+      LOG_EVERY_N(INFO, FLAGS_consumer_log_frequency)
         << "DB name: " << db_name << ", Key " << folly::hexlify(*message->key())
         << ", "
         << "value "
-        << folly::hexlify(folly::StringPiece(
-               static_cast<const char*>(message->payload()), message->len()))
+        << ((FLAGS_enable_logging_consumer_log_with_payload)
+          ? (folly::hexlify(folly::StringPiece(
+            static_cast<const char *>(message->payload()), message->len())))
+          : ("***REDACTED***"))
         << ", "
         << "partition: " << message->partition() << ", "
         << "offset: " << message->offset() << ", "
         << "payload len: " << message->len() << ", "
         << "msg_timestamp: " << ToUTC(msg_timestamp_secs) << " or "
         << std::to_string(msg_timestamp_secs) << " secs";
+    }
 
     if (!is_replay) {
       auto latency_ms = common::timeutil::GetCurrentTimestamp(
@@ -1425,7 +1964,10 @@ void AdminHandler::async_tm_startMessageIngestion(
     if (message_count % FLAGS_kafka_ts_update_interval == 0) {
       const auto timestamp_ms = message->timestamp().timestamp;
       const auto meta = getMetaData(db_name);
-      writeMetaData(db_name, meta.s3_bucket, meta.s3_path, timestamp_ms);
+      if (!writeMetaData(db_name, meta.s3_bucket, meta.s3_path, timestamp_ms)) {
+        LOG(ERROR) << "StartMessageIngestion failed to write DBMetaData for " << db_name;
+        return;
+      } 
       LOG(INFO) << "[meta_db] Writing timestamp " << timestamp_ms
                 << " for db: " << db_name;
     }
@@ -1465,8 +2007,8 @@ void AdminHandler::async_tm_stopMessageIngestion(
     auto iter = kafka_watcher_map_.find(db_name);
     // Verify that there is thread consuming messages for this db.
     if (iter == kafka_watcher_map_.end()) {
-      e.message = db_name + " is not being consumed";
-      callback.release()->exceptionInThread(std::move(e));
+      // Log and return if there is no thread consuming kafka messages.
+      callback.release()->result(StopMessageIngestionResponse());
       LOG(ERROR) << db_name << " is not being currently consumed";
       return;
     }

@@ -1,16 +1,12 @@
 package com.pinterest.rocksplicator.task;
 
-import org.apache.helix.HelixManagerFactory;
-import org.apache.helix.InstanceType;
 import org.apache.helix.TestHelper;
-import org.apache.helix.integration.manager.ClusterControllerManager;
 import org.apache.helix.integration.manager.MockParticipantManager;
 import org.apache.helix.integration.task.TaskTestBase;
 import org.apache.helix.participant.StateMachineEngine;
 import org.apache.helix.task.JobConfig;
 import org.apache.helix.task.Task;
 import org.apache.helix.task.TaskConfig;
-import org.apache.helix.task.TaskDriver;
 import org.apache.helix.task.TaskFactory;
 import org.apache.helix.task.TaskResult;
 import org.apache.helix.task.TaskState;
@@ -18,13 +14,13 @@ import org.apache.helix.task.TaskStateModelFactory;
 import org.apache.helix.task.TaskUtil;
 import org.apache.helix.task.Workflow;
 import org.apache.helix.task.WorkflowConfig;
-import org.apache.helix.tools.ClusterSetup;
-
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
-import org.testng.Assert;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -40,6 +36,8 @@ import java.util.concurrent.CountDownLatch;
 
 public class TestBackupTaskFactory extends TaskTestBase {
 
+  private static final Logger LOG = LoggerFactory.getLogger(TestBackupTaskFactory.class);
+
   private static final String JOB_COMMAND = "DummyCommand";
   private static final int NUM_JOB = 2;
   private static final int NUM_TASK_PER_JOB = 2;
@@ -47,56 +45,28 @@ public class TestBackupTaskFactory extends TaskTestBase {
   private Map<String, String> _jobCommandMap;
 
   private static final long fakeResourceVersion = 1234L;
+  private static final String fakeS3Bucket = "pinterest-fake-bucket";
 
   private final CountDownLatch allTasksReady = new CountDownLatch(NUM_TASK);
   private final CountDownLatch adminReady = new CountDownLatch(1);
 
 
+  @Override
+  protected void startParticipant(String zkAddr, int i) {
+    final String instanceName = PARTICIPANT_PREFIX + "_" + (_startPort + i);
+    Map<String, TaskFactory> taskFactoryReg = new HashMap();
+    taskFactoryReg.put("Backup", new DummyBackupTaskFactory(CLUSTER_NAME,
+        Integer.parseInt(instanceName.split("_")[1]), true, fakeS3Bucket));
+    this._participants[i] = new MockParticipantManager(zkAddr, this.CLUSTER_NAME, instanceName);
+    StateMachineEngine stateMachine = this._participants[i].getStateMachineEngine();
+    stateMachine.registerStateModelFactory("Task",
+        new TaskStateModelFactory(this._participants[i], taskFactoryReg));
+    this._participants[i].syncStart();
+  }
+
   @BeforeClass
   public void beforeClass() throws Exception {
-    _participants = new MockParticipantManager[_numNodes];
-    String namespace = "/" + CLUSTER_NAME;
-    if (_gZkClient.exists(namespace)) {
-      _gZkClient.deleteRecursively(namespace);
-    }
-
-    // Setup cluster and instances
-    ClusterSetup setupTool = new ClusterSetup(ZK_ADDR);
-    setupTool.addCluster(CLUSTER_NAME, true);
-    for (int i = 0; i < _numNodes; i++) {
-      String storageNodeName = PARTICIPANT_PREFIX + "_" + (_startPort + i);
-      setupTool.addInstanceToCluster(CLUSTER_NAME, storageNodeName);
-    }
-
-    // start dummy participants
-    for (int i = 0; i < _numNodes; i++) {
-      final String instanceName = PARTICIPANT_PREFIX + "_" + (_startPort + i);
-
-      // Set task callbacks
-      Map<String, TaskFactory> taskFactoryReg = new HashMap<>();
-      taskFactoryReg.put("Backup", new DummyBackupTaskFactory(CLUSTER_NAME,
-          Integer.parseInt(instanceName.split("_")[1])));
-
-      _participants[i] = new MockParticipantManager(ZK_ADDR, CLUSTER_NAME, instanceName);
-
-      // Register a Task state model factory.
-      StateMachineEngine stateMachine = _participants[i].getStateMachineEngine();
-      stateMachine.registerStateModelFactory("Task",
-          new TaskStateModelFactory(_participants[i], taskFactoryReg));
-      _participants[i].syncStart();
-    }
-
-    // Start controller
-    String controllerName = CONTROLLER_PREFIX + "_0";
-    _controller = new ClusterControllerManager(ZK_ADDR, CLUSTER_NAME, controllerName);
-    _controller.syncStart();
-
-    // Start an admin connection
-    _manager = HelixManagerFactory.getZKHelixManager(CLUSTER_NAME, "Admin",
-        InstanceType.ADMINISTRATOR, ZK_ADDR);
-    _manager.connect();
-    _driver = new TaskDriver(_manager);
-
+    super.beforeClass();
     _jobCommandMap = new HashMap<>();
   }
 
@@ -155,19 +125,34 @@ public class TestBackupTaskFactory extends TaskTestBase {
       Assert.assertEquals(jobConfig.getCommand(), JOB_COMMAND);
 
       Set<String> taskTargetParts = new HashSet<>();
+      int taskPartitionId = 0;
       for (TaskConfig taskConfig : _driver.getJobConfig(namespacedJobName).getTaskConfigMap()
           .values()) {
         Assert.assertEquals(taskConfig.getCommand(), "Backup");
         taskTargetParts.add(taskConfig.getTargetPartition());
 
         Assert.assertEquals(jobConfig.getJobCommandConfigMap().get("STORE_PATH_PREFIX"),
-            _driver.getTaskUserContentMap(workflowName, jobName, "0").get("storePathPrefix"));
+            _driver.getTaskUserContentMap(workflowName, jobName, String.valueOf(taskPartitionId))
+                .get("storePathPrefix"));
 
         Assert.assertEquals(jobConfig.getJobCommandConfigMap().get("BACKUP_LIMIT_MBS"),
-            _driver.getTaskUserContentMap(workflowName, jobName, "0").get("backupLimitMbs"));
+            _driver.getTaskUserContentMap(workflowName, jobName, String.valueOf(taskPartitionId))
+                .get("backupLimitMbs"));
 
         Assert.assertEquals(jobConfig.getJobCommandConfigMap().get("RESOURCE_VERSION"),
-            _driver.getTaskUserContentMap(workflowName, jobName, "0").get("resourceVersion"));
+            _driver.getTaskUserContentMap(workflowName, jobName, String.valueOf(taskPartitionId))
+                .get("resourceVersion"));
+
+        Assert.assertEquals(
+            _driver.getTaskUserContentMap(workflowName, jobName, String.valueOf(taskPartitionId))
+                .get("useS3Store"), "true");
+
+        Assert.assertEquals(
+            _driver.getTaskUserContentMap(workflowName, jobName, String.valueOf(taskPartitionId))
+                .get("s3Bucket"),
+            fakeS3Bucket);
+
+        taskPartitionId++;
       }
 
       Assert
@@ -213,25 +198,30 @@ public class TestBackupTaskFactory extends TaskTestBase {
 
   private class DummyBackupTaskFactory extends BackupTaskFactory {
 
-    public DummyBackupTaskFactory(String cluster, int adminPort) {
-      super(cluster, adminPort);
+    public DummyBackupTaskFactory(String cluster, int adminPort, boolean useS3Store,
+                                  String s3Bucket) {
+      super(cluster, adminPort, useS3Store, s3Bucket);
     }
 
     @Override
     protected Task getTask(String cluster, String targetPartition, int backupLimitMbs,
-                           String storePathPrefix, long resourceVersion, String job, int port) {
+                           String storePathPrefix, long resourceVersion, String job, int port,
+                           boolean useS3Store, String s3Bucket, boolean shareFilesWithChecksum,
+                           TaskConfig taskConfig) {
       return new DummyBackupTask(cluster, targetPartition, backupLimitMbs, storePathPrefix,
-          resourceVersion, job, port);
+          resourceVersion, job, port, useS3Store, s3Bucket, shareFilesWithChecksum, taskConfig);
     }
+
   }
 
   private class DummyBackupTask extends BackupTask {
 
     public DummyBackupTask(String taskCluster, String partitionName, int backupLimitMbs,
-                           String storePathPrefix, long resourceVersion, String job,
-                           int adminPort) {
+                           String storePathPrefix, long resourceVersion, String job, int adminPort,
+                           boolean useS3Store, String s3Bucket, boolean shareFilesWithChecksum,
+                           TaskConfig taskConfig) {
       super(taskCluster, partitionName, backupLimitMbs, storePathPrefix, resourceVersion, job,
-          adminPort);
+          adminPort, useS3Store, s3Bucket, shareFilesWithChecksum, taskConfig);
     }
 
     @Override
@@ -253,11 +243,32 @@ public class TestBackupTaskFactory extends TaskTestBase {
         putUserContent("backupLimitMbs", String.valueOf(backupLimitMbs), Scope.TASK);
         putUserContent("storePathPrefix", storePathPrefix, Scope.TASK);
       } catch (Exception e) {
-        System.out.println(
+        LOG.error(
             "Failed to read super class's private filed or fail to pur userStore" + e.getMessage());
       }
 
+      try {
+        super.run();
+      } catch (Exception e) {
+        LOG.error("Failed to execute BackupTask run" + e.getMessage());
+      }
+
       return new TaskResult(TaskResult.Status.COMPLETED, "");
+    }
+
+    @Override
+    protected void executeBackup(String host, int port, String dbName, String storePath,
+                                 int backupLimitMbs, boolean useS3Store, String s3Bucket,
+                                 boolean shareFilesWithChecksum)
+        throws RuntimeException {
+      try {
+        boolean useS3 = readPrivateSuperClassBooleanField("useS3Store");
+        String bucket = readPrivateSuperClassStringField("s3Bucket");
+        putUserContent("useS3Store", String.valueOf(useS3), Scope.TASK);
+        putUserContent("s3Bucket", bucket, Scope.TASK);
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
     }
 
     @Override
@@ -286,6 +297,13 @@ public class TestBackupTaskFactory extends TaskTestBase {
       Field field = clazz.getDeclaredField(fieldName);
       field.setAccessible(true);
       return (String) field.get(this);
+    }
+
+    private boolean readPrivateSuperClassBooleanField(String fieldName) throws Exception {
+      Class<?> clazz = getClass().getSuperclass();
+      Field field = clazz.getDeclaredField(fieldName);
+      field.setAccessible(true);
+      return (Boolean) field.get(this);
     }
   }
 }

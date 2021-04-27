@@ -74,17 +74,19 @@ public:
 
   // If set to a value other than -1, will seek kafka consumer to this
   // timestamp ms during initialization.
-  void Start(int64_t initial_kafka_seek_timestamp_ms = -1);
+  // return false if init or seek fails internally rather than fail silently
+  bool Start(int64_t initial_kafka_seek_timestamp_ms = -1);
 
   // If last_offsets is not empty, will seek kafka consumer to the
   // last_offsets + 1 during initialization.
-  void Start(const std::map<std::string, std::map<int32_t,
+  // return false if init or seek fails internally rather than fail silently
+  bool Start(const std::map<std::string, std::map<int32_t,
       int64_t>>& last_offsets);
 
-  void StartWith(int64_t initial_kafka_seek_timestamp_ms,
+  bool StartWith(int64_t initial_kafka_seek_timestamp_ms,
       KafkaMessageHandler handler);
 
-  void StartWith(const std::map<std::string, std::map<int32_t,
+  bool StartWith(const std::map<std::string, std::map<int32_t,
       int64_t>>& last_offsets,
       KafkaMessageHandler handler);
 
@@ -92,6 +94,8 @@ public:
   // next iteration. Can be called to signal multiple KafkaWatchers to
   // stop in parallel
   void Stop() { is_stopped_.store(true); }
+
+  uint64_t ErrorCount() { return err_count_.load(); }
 
   // Blocking call which signals the watch loop to terminate at the next
   // iteration and blocks and waits for the watch thread to end.
@@ -159,12 +163,13 @@ private:
 
   // Consumes messages up to the current timestamp for a given consumer.
   // Returns how many messages are consumed.
-  uint32_t ConsumeUpToNow(const kafka::KafkaConsumer& consumer);
+  uint32_t ConsumeUpToNow(kafka::KafkaConsumer& consumer);
 
   void StartWatchLoop();
 
   std::thread thread_;
   std::atomic<bool> is_stopped_;
+  std::atomic<uint64_t> err_count_{0};
 
   const std::vector<std::shared_ptr<kafka::KafkaConsumerPool>>
     kafka_consumer_pools_;

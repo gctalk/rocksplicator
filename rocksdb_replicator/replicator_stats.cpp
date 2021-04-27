@@ -34,11 +34,16 @@ const std::string kReplicatorWriteBytes = "replicator_write_bytes";
 const std::string kReplicatorConnectionErrors = "replicator_connection_errors";
 const std::string kReplicatorRemoteApplicationExceptions =
   "replicator_remote_app_exceptions";
+const std::string kReplicatorRemoteApplicationExceptionsNotFound =
+  "replicator_remote_app_exceptions_source_not_found";
+const std::string kReplicatorLeaderReset =
+  "replicator_remote_app_leader_reset";
 const std::string kReplicatorGetUpdatesSinceErrors =
   "replicator_get_update_since_errors";
 const std::string kReplicatorGetUpdatesSinceMs =
   "replicator_get_update_since_ms";
 const std::string kReplicatorWriteMs = "replicator_write_ms";
+const std::string kReplicatorLeaderSequenceNumbersBehind = "replicator_leader_sequence_numbers_behind";
 
 
 void logMetric(const std::string& metric_name, int64_t value,

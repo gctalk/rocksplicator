@@ -26,18 +26,17 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
-import org.apache.curator.retry.ExponentialBackoffRetry;
+import org.apache.curator.retry.BoundedExponentialBackoffRetry;
 import org.apache.helix.NotificationContext;
 import org.apache.helix.model.Message;
 import org.apache.helix.participant.statemachine.StateModel;
 import org.apache.helix.participant.statemachine.StateModelFactory;
-import org.apache.thrift.protocol.TBinaryProtocol;
-import org.apache.thrift.transport.TSocket;
-import org.apache.thrift.transport.TTransportException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel> {
+
+  private static final int MAX_ZK_RETRIES = 7;
   private final int adminPort;
   private final String cluster;
   private CuratorFramework zkClient;
@@ -48,7 +47,7 @@ public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel
     this.adminPort = adminPort;
     this.cluster = cluster;
     this.zkClient = CuratorFrameworkFactory.newClient(zkConnectString,
-        new ExponentialBackoffRetry(1000, 3));
+        new BoundedExponentialBackoffRetry(1000, 10000, MAX_ZK_RETRIES));
     zkClient.start();
   }
 
@@ -59,6 +58,7 @@ public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel
   }
 
   public static class OnlineOfflineStateModel extends StateModel {
+
     private static final Logger LOG = LoggerFactory.getLogger(OnlineOfflineStateModel.class);
 
     private final String resourceName;
@@ -86,14 +86,13 @@ public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel
      * We first make sure the DB is open and then load SST files into the DB.
      */
     public void onBecomeOnlineFromOffline(Message message, NotificationContext context) {
-      Utils.checkSanity("OFFLINE", "ONLINE", message, resourceName, partitionName);
+      Utils.checkStateTransitions("OFFLINE", "ONLINE", message, resourceName, partitionName);
       Utils.logTransitionMessage(message);
 
       Utils.addDB(Utils.getDbName(partitionName), adminPort);
 
       try {
-        zkClient.sync().forPath(Utils.getMetaLocation(cluster, resourceName));
-        String meta = new String(zkClient.getData().forPath(Utils.getMetaLocation(cluster, resourceName)));
+        String meta = Utils.getMetaData(zkClient, cluster, resourceName, MAX_ZK_RETRIES);
         JsonObject jsonObject = new JsonParser().parse(meta).getAsJsonObject();
 
         String s3Path = jsonObject.get("s3_path").getAsString();
@@ -117,6 +116,7 @@ public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel
         LOG.error("Failed to add S3 files for " + partitionName, e);
         throw new RuntimeException(e);
       }
+      Utils.logTransitionCompletionMessage(message);
     }
 
     /**
@@ -124,10 +124,11 @@ public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel
      * The callback simply close the DB.
      */
     public void onBecomeOfflineFromOnline(Message message, NotificationContext context) {
-      Utils.checkSanity("ONLINE", "OFFLINE", message, resourceName, partitionName);
+      Utils.checkStateTransitions("ONLINE", "OFFLINE", message, resourceName, partitionName);
       Utils.logTransitionMessage(message);
 
       Utils.closeDB(Utils.getDbName(partitionName), adminPort);
+      Utils.logTransitionCompletionMessage(message);
     }
 
     /**
@@ -135,10 +136,11 @@ public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel
      * The callback simply clear the DB.
      */
     public void onBecomeDroppedFromOffline(Message message, NotificationContext context) {
-      Utils.checkSanity("OFFLINE", "DROPPED", message, resourceName, partitionName);
+      Utils.checkStateTransitions("OFFLINE", "DROPPED", message, resourceName, partitionName);
       Utils.logTransitionMessage(message);
 
       Utils.clearDB(Utils.getDbName(partitionName), adminPort);
+      Utils.logTransitionCompletionMessage(message);
     }
 
     /**
@@ -146,10 +148,11 @@ public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel
      * The callback simply clear the DB.
      */
     public void onBecomeDroppedFromError(Message message, NotificationContext context) {
-      Utils.checkSanity("ERROR", "DROPPED", message, resourceName, partitionName);
+      Utils.checkStateTransitions("ERROR", "DROPPED", message, resourceName, partitionName);
       Utils.logTransitionMessage(message);
 
       Utils.clearDB(Utils.getDbName(partitionName), adminPort);
+      Utils.logTransitionCompletionMessage(message);
     }
 
     /**
@@ -157,8 +160,9 @@ public class OnlineOfflineStateModelFactory extends StateModelFactory<StateModel
      * The callback does nothing
      */
     public void onBecomeOfflineFromError(Message message, NotificationContext context) {
-      Utils.checkSanity("ERROR", "OFFLINE", message, resourceName, partitionName);
+      Utils.checkStateTransitions("ERROR", "OFFLINE", message, resourceName, partitionName);
       Utils.logTransitionMessage(message);
+      Utils.logTransitionCompletionMessage(message);
     }
   }
 }

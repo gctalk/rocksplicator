@@ -19,6 +19,9 @@
 package com.pinterest.rocksplicator;
 
 import com.pinterest.rocksdb_admin.thrift.CheckDBResponse;
+import com.pinterest.rocksplicator.eventstore.LeaderEventsCollector;
+import com.pinterest.rocksplicator.eventstore.LeaderEventsLogger;
+import com.pinterest.rocksplicator.thrift.eventhistory.LeaderEventType;
 
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
@@ -83,7 +86,10 @@ import java.util.concurrent.TimeUnit;
  *    a) clearDB()
  */
 public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> {
+
   private static final Logger LOG = LoggerFactory.getLogger(MasterSlaveStateModelFactory.class);
+  private static final String LOCAL_HOST_IP = "127.0.0.1";
+  private static final int MASTER_CATCH_UP_THRESHOLD = 100;
 
   private final String host;
   private final int adminPort;
@@ -91,9 +97,16 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
   private CuratorFramework zkClient;
   private final boolean useS3Backup;
   private final String s3Bucket;
+  private final LeaderEventsLogger leaderEventsLogger;
 
   public MasterSlaveStateModelFactory(
-      String host, int adminPort, String zkConnectString, String cluster, boolean useS3Backup, String s3Bucket) {
+      final String host,
+      final int adminPort,
+      final String zkConnectString,
+      final String cluster,
+      final boolean useS3Backup,
+      final String s3Bucket,
+      final LeaderEventsLogger leaderEventsLogger) {
     this.host = host;
     this.adminPort = adminPort;
     this.cluster = cluster;
@@ -102,17 +115,27 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
     this.zkClient = CuratorFrameworkFactory.newClient(zkConnectString,
         new ExponentialBackoffRetry(1000, 3));
     zkClient.start();
+    this.leaderEventsLogger = leaderEventsLogger;
   }
 
   @Override
   public StateModel createNewStateModel(String resourceName, String partitionName) {
     LOG.error("Create a new state for " + partitionName);
     return new MasterSlaveStateModel(
-        resourceName, partitionName, host, adminPort, cluster, zkClient, useS3Backup, s3Bucket);
+        resourceName,
+        partitionName,
+        host,
+        adminPort,
+        cluster,
+        zkClient,
+        useS3Backup,
+        s3Bucket,
+        leaderEventsLogger);
   }
 
 
   public static class MasterSlaveStateModel extends StateModel {
+
     private static final Logger LOG = LoggerFactory.getLogger(MasterSlaveStateModel.class);
 
     private final String resourceName;
@@ -124,14 +147,21 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
     private final boolean useS3Backup;
     private final String s3Bucket;
     private InterProcessMutex partitionMutex;
+    private final LeaderEventsLogger leaderEventsLogger;
 
 
     /**
      * State model that handles the state machine of a single replica
      */
-    public MasterSlaveStateModel(String resourceName, String partitionName, String host,
-                                  int adminPort, String cluster, CuratorFramework zkClient,
-                                  boolean useS3Backup, String s3Bucket) {
+    public MasterSlaveStateModel(
+        final String resourceName,
+        final String partitionName,
+        final String host,
+        final int adminPort,
+        final String cluster,
+        final CuratorFramework zkClient,
+        final boolean useS3Backup, String s3Bucket,
+        final LeaderEventsLogger leaderEventsLogger) {
       this.resourceName = resourceName;
       this.partitionName = partitionName;
       this.host = host;
@@ -142,21 +172,29 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
       this.s3Bucket = s3Bucket;
       this.partitionMutex = new InterProcessMutex(zkClient,
           getLockPath(cluster, resourceName, partitionName));
+      this.leaderEventsLogger = leaderEventsLogger;
     }
 
     /**
      * 1) Slave to Master
      */
     public void onBecomeMasterFromSlave(Message message, NotificationContext context) {
+      LeaderEventsCollector leaderEventsCollector
+          = leaderEventsLogger.newEventsCollector(resourceName, partitionName);
+
+      leaderEventsCollector.addEvent(LeaderEventType.PARTICIPANT_LEADER_UP_INIT, null);
+
       Utils.logTransitionMessage(message);
+      final String dbName = Utils.getDbName(partitionName);
 
       try (Locker locker = new Locker(partitionMutex)) {
         HelixAdmin admin = context.getManager().getClusterManagmentTool();
         Map<String, String> stateMap = null;
+        ExternalView view = null;
 
         // sanity check no existing Master for up to 59 seconds
         for (int i = 0; i < 60; ++i) {
-          ExternalView view = admin.getResourceExternalView(cluster, resourceName);
+          view = admin.getResourceExternalView(cluster, resourceName);
           stateMap = view.getStateMap(partitionName);
 
           if (!stateMap.containsValue("MASTER")) {
@@ -171,7 +209,6 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
           LOG.error("Slept for " + String.valueOf(i + 1) + " seconds for 0 Master");
         }
 
-        final String dbName = Utils.getDbName(partitionName);
         // make sure local replica has the highest sequence number
         long localSeq = Utils.getLocalLatestSequenceNumber(dbName, adminPort);
         String hostWithHighestSeq = null;
@@ -199,14 +236,15 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
           LOG.error("Found another host " + hostWithHighestSeq + " with higher seq num: " +
               String.valueOf(highestSeq) + " for " + dbName);
           Utils.changeDBRoleAndUpStream(
-              "localhost", adminPort, dbName, "SLAVE", hostWithHighestSeq, adminPort);
+              LOCAL_HOST_IP, adminPort, dbName, "SLAVE", hostWithHighestSeq, adminPort);
 
           // wait for up to 10 mins
           for (int i = 0; i < 600; ++i) {
             TimeUnit.SECONDS.sleep(1);
             long newLocalSeq = Utils.getLocalLatestSequenceNumber(dbName, adminPort);
-            LOG.error("Replicated [" + String.valueOf(localSeq) + ", " + String.valueOf(newLocalSeq) +
-              ") from " + hostWithHighestSeq + " for " + dbName);
+            LOG.error(
+                "Replicated [" + String.valueOf(localSeq) + ", " + String.valueOf(newLocalSeq) +
+                    ") from " + hostWithHighestSeq + " for " + dbName);
             localSeq = newLocalSeq;
             if (highestSeq <= localSeq) {
               LOG.error(dbName + " catched up!");
@@ -222,9 +260,14 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
         }
 
         // changeDBRoleAndUpStream(me, "Master")
-        Utils.changeDBRoleAndUpStream("localhost", adminPort, dbName, "MASTER",
-        "", adminPort);
+        Utils.changeDBRoleAndUpStream(LOCAL_HOST_IP, adminPort, dbName, "MASTER",
+            "", adminPort);
 
+        // Get the latest external view and state map
+        LOG.error("[" + dbName + "] Getting external view");
+        view = admin.getResourceExternalView(cluster, resourceName);
+        LOG.error("[" + dbName + "] Got external view");
+        stateMap = view.getStateMap(partitionName);
         // changeDBRoleAndUpStream(all_other_slaves_or_offlines, "Slave", "my_ip_port")
         for (Map.Entry<String, String> instanceNameAndRole : stateMap.entrySet()) {
           String hostName = instanceNameAndRole.getKey().split("_")[0];
@@ -240,35 +283,87 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
                 instanceNameAndRole.getValue().equalsIgnoreCase("OFFLINE")) {
               Utils.changeDBRoleAndUpStream(
                   hostName, port, dbName, "SLAVE", this.host, adminPort);
+              LOG.error("[" + dbName + "] Done calling changeDBRoleAndUpStream");
             }
           } catch (RuntimeException e) {
             LOG.error("Failed to set upstream for " + dbName + " on " + hostName + e.toString());
           }
         }
+        leaderEventsCollector
+            .addEvent(LeaderEventType.PARTICIPANT_LEADER_UP_SUCCESS, null);
+        LOG.error("[" + dbName + "] Done calling leaderEventsCollector.addEvent");
       } catch (RuntimeException e) {
+        leaderEventsCollector.addEvent(LeaderEventType.PARTICIPANT_LEADER_UP_FAILURE, null);
         LOG.error(e.toString());
         throw e;
       } catch (Exception e) {
+        leaderEventsCollector.addEvent(LeaderEventType.PARTICIPANT_LEADER_UP_FAILURE, null);
         LOG.error("Failed to release the mutex for partition " + resourceName + "/" + partitionName,
             e);
+      } finally {
+        LOG.error("[" + dbName + "] Calling leaderEventsCollector.commit");
+        leaderEventsCollector.commit();
+        LOG.error("[" + dbName + "] Done calling leaderEventsCollector.commit");
       }
+      Utils.logTransitionCompletionMessage(message);
     }
 
     /**
      * 2) Master to Slave
      */
     public void onBecomeSlaveFromMaster(Message message, NotificationContext context) {
+      LeaderEventsCollector leaderEventsCollector
+          = leaderEventsLogger.newEventsCollector(resourceName, partitionName);
+
+      leaderEventsCollector.addEvent(LeaderEventType.PARTICIPANT_LEADER_DOWN_INIT, null);
       Utils.logTransitionMessage(message);
 
       try (Locker locker = new Locker(partitionMutex)) {
-        Utils.changeDBRoleAndUpStream("localhost", adminPort, Utils.getDbName(partitionName),
-            "SLAVE", "127.0.0.1", adminPort);
+        Utils.changeDBRoleAndUpStream(LOCAL_HOST_IP, adminPort, Utils.getDbName(partitionName),
+            "SLAVE", LOCAL_HOST_IP, adminPort);
+        leaderEventsCollector.addEvent(LeaderEventType.PARTICIPANT_LEADER_DOWN_SUCCESS, null);
       } catch (RuntimeException e) {
+        leaderEventsCollector.addEvent(LeaderEventType.PARTICIPANT_LEADER_DOWN_FAILURE, null);
         throw e;
       } catch (Exception e) {
+        leaderEventsCollector.addEvent(LeaderEventType.PARTICIPANT_LEADER_DOWN_FAILURE, null);
         LOG.error("Failed to release the mutex for partition " + resourceName + "/" + partitionName,
             e);
+      } finally {
+        leaderEventsCollector.commit();
       }
+      Utils.logTransitionCompletionMessage(message);
+    }
+
+    public Map<String, String> getLiveHostAndRole(NotificationContext context, String dbName) {
+      HelixAdmin admin = context.getManager().getClusterManagmentTool();
+      ExternalView view = admin.getResourceExternalView(cluster, resourceName);
+      Map<String, String> stateMap = view.getStateMap(partitionName);
+
+      // find live replicas
+      Map<String, String> liveHostAndRole = new HashMap<>();
+      for (Map.Entry<String, String> instanceNameAndRole : stateMap.entrySet()) {
+        String role = instanceNameAndRole.getValue();
+        if (!role.equalsIgnoreCase("MASTER") &&
+            !role.equalsIgnoreCase("SLAVE") &&
+            !role.equalsIgnoreCase("OFFLINE")) {
+          continue;
+        }
+
+        String hostPort = instanceNameAndRole.getKey();
+        String host = hostPort.split("_")[0];
+        int port = Integer.parseInt(hostPort.split("_")[1]);
+
+        if (this.host.equals(host)) {
+          // myself
+          continue;
+        }
+
+        if (Utils.getLatestSequenceNumber(dbName, host, port) != -1) {
+          liveHostAndRole.put(hostPort, role);
+        }
+      }
+      return liveHostAndRole;
     }
 
     /**
@@ -287,33 +382,8 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
           // open the DB if it's currently not opened yet
           Utils.addDB(dbName, adminPort);
 
-          HelixAdmin admin = context.getManager().getClusterManagmentTool();
-          ExternalView view = admin.getResourceExternalView(cluster, resourceName);
-          Map<String, String> stateMap = view.getStateMap(partitionName);
-
           // find live replicas
-          Map<String, String> liveHostAndRole = new HashMap<>();
-          for (Map.Entry<String, String> instanceNameAndRole : stateMap.entrySet()) {
-            String role = instanceNameAndRole.getValue();
-            if (!role.equalsIgnoreCase("MASTER") &&
-                !role.equalsIgnoreCase("SLAVE") &&
-                !role.equalsIgnoreCase("OFFLINE")) {
-              continue;
-            }
-
-            String hostPort = instanceNameAndRole.getKey();
-            String host = hostPort.split("_")[0];
-            int port = Integer.parseInt(hostPort.split("_")[1]);
-
-            if (this.host.equals(host)) {
-              // myself
-              continue;
-            }
-
-            if (Utils.getLatestSequenceNumber(dbName, host, port) != -1) {
-              liveHostAndRole.put(hostPort, role);
-            }
-          }
+          Map<String, String> liveHostAndRole = getLiveHostAndRole(context, dbName);
 
           // Find upstream, prefer Master
           String upstream = null;
@@ -326,17 +396,30 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
               upstream = instanceNameAndRole.getKey();
             }
           }
-          String upstreamHost = (upstream == null ? "127.0.0.1" : upstream.split("_")[0]);
+          String upstreamHost = (upstream == null ? LOCAL_HOST_IP : upstream.split("_")[0]);
           snapshotHost = upstreamHost;
           int upstreamPort =
               (upstream == null ? adminPort : Integer.parseInt(upstream.split("_")[1]));
           snapshotPort = upstreamPort;
 
           // check if the local replica needs rebuild
-          CheckDBResponse localStatus = Utils.checkLocalDB(dbName, adminPort);
+          CheckDBResponse
+              localStatus =
+              Utils.checkRemoteOrLocalDB(LOCAL_HOST_IP, adminPort, dbName, true, null, null);
+          CheckDBResponse upstreamStatus = null;
+          if (!upstreamHost.equals(LOCAL_HOST_IP) && !upstreamHost.equals(this.host)) {
+            upstreamStatus =
+                Utils.checkRemoteOrLocalDB(upstreamHost, upstreamPort, dbName, true, null, null);
+          }
 
           boolean needRebuild = true;
-          if (liveHostAndRole.isEmpty()) {
+          if (upstreamStatus != null && upstreamStatus.isSetDb_metas() && !upstreamStatus.db_metas
+              .equals(localStatus.db_metas)) {
+            LOG.error(String.format(
+                "upstreamStatus exist and differ from localStatus, rebuild. upstreamStatus: %s, "
+                    + "localStatus: %s",
+                upstreamStatus.toString(), localStatus.toString()));
+          } else if (liveHostAndRole.isEmpty()) {
             LOG.error("No other live replicas, skip rebuild " + dbName);
             needRebuild = false;
           } else if (System.currentTimeMillis() <
@@ -354,9 +437,9 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
 
           // if rebuild is not needed, setup upstream and return
           if (!needRebuild) {
-            Utils.changeDBRoleAndUpStream("localhost", adminPort, dbName, "SLAVE",
+            Utils.changeDBRoleAndUpStream(LOCAL_HOST_IP, adminPort, dbName, "SLAVE",
                 upstreamHost, upstreamPort);
-
+            Utils.logTransitionCompletionMessage(message);
             return;
           }
         } catch (RuntimeException e) {
@@ -378,7 +461,7 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
         // local partition as error.
         if (!useS3Backup) {
           String hdfsPath = "/rocksplicator/" + cluster + "/" + dbName + "/" + snapshotHost + "_"
-            + String.valueOf(snapshotPort) + "/" + String.valueOf(System.currentTimeMillis());
+              + String.valueOf(snapshotPort) + "/" + String.valueOf(System.currentTimeMillis());
 
           // backup a snapshot from the upstream host, and restore it locally
           LOG.error("Backup " + dbName + " from " + snapshotHost);
@@ -388,14 +471,58 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
           Utils.restoreLocalDB(adminPort, dbName, hdfsPath, snapshotHost, snapshotPort);
         } else {
           String s3Path = "backup/" + cluster + "/" + dbName + "/" + snapshotHost + "_"
-            + String.valueOf(snapshotPort) + "/" + String.valueOf(System.currentTimeMillis());
+              + String.valueOf(snapshotPort) + "/" + String.valueOf(System.currentTimeMillis());
 
           // backup a snapshot from the upstream host, and restore it locally
           LOG.error("S3 Backup " + dbName + " from " + snapshotHost);
           Utils.backupDBToS3(snapshotHost, snapshotPort, dbName, s3Bucket, s3Path);
           LOG.error("S3 Restore " + dbName + " from " + s3Path);
           Utils.closeDB(dbName, adminPort);
-          Utils.restoreLocalDBFromS3(adminPort, dbName, s3Bucket, s3Path, snapshotHost, snapshotPort);
+          Utils.restoreLocalDBFromS3(adminPort, dbName, s3Bucket, s3Path, snapshotHost,
+              snapshotPort);
+        }
+
+        try {
+          LOG.error(dbName + " Catching up live updates to master");
+          Map<String, String> liveHostAndRole = getLiveHostAndRole(context, dbName);
+          // Find upstream, prefer Master
+          String upstream = null;
+          for (Map.Entry<String, String> instanceNameAndRole : liveHostAndRole.entrySet()) {
+            String role = instanceNameAndRole.getValue();
+            if (role.equalsIgnoreCase("OFFLINE")) {
+              continue;
+            }
+            if (role.equalsIgnoreCase("MASTER")) {
+              upstream = instanceNameAndRole.getKey();
+              break;
+            } else {
+              upstream = instanceNameAndRole.getKey();
+            }
+          }
+
+          String upstreamHost = (upstream == null ? LOCAL_HOST_IP : upstream.split("_")[0]);
+          LOG.error(dbName + " got master " + upstreamHost);
+          int upstreamPort =
+              (upstream == null ? adminPort : Integer.parseInt(upstream.split("_")[1]));
+
+          long local_seq_num;
+          long master_seq_num;
+          // wait for up to 10 mins
+          for (int i = 0; i < 600; ++i) {
+            local_seq_num = Utils.getLocalLatestSequenceNumber(dbName, adminPort);
+            master_seq_num = Utils.getLatestSequenceNumber(dbName, upstreamHost, upstreamPort);
+
+            // If master sequence number is within threshold, consider caught up.
+            if (master_seq_num < local_seq_num + MASTER_CATCH_UP_THRESHOLD) {
+              LOG.error(dbName + " caught up!");
+              break;
+            }
+            TimeUnit.SECONDS.sleep(1);
+          }
+        } catch (Exception e) {
+          // We've already backed up master data and restored, ignore exception while
+          // waiting to catch up to master
+          LOG.error("Failed to catch up to master after backup " + dbName, e);
         }
       }
     }
@@ -471,6 +598,7 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
         LOG.error("Failed to release the mutex for partition " + resourceName + "/" + partitionName,
             e);
       }
+      Utils.logTransitionCompletionMessage(message);
     }
 
     /**
@@ -485,6 +613,7 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
         LOG.error("Failed to release the mutex for partition " + resourceName + "/" + partitionName,
             e);
       }
+      Utils.logTransitionCompletionMessage(message);
     }
 
     /**
@@ -499,6 +628,7 @@ public class MasterSlaveStateModelFactory extends StateModelFactory<StateModel> 
         LOG.error("Failed to release the mutex for partition " + resourceName + "/" + partitionName,
             e);
       }
+      Utils.logTransitionCompletionMessage(message);
     }
 
     /**

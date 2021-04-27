@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include "common/object_lock.h"
@@ -50,7 +51,7 @@ class AdminHandler : virtual public AdminSvIf {
     std::unique_ptr<ApplicationDBManager> db_manager,
     RocksDBOptionsGeneratorType rocksdb_options);
 
-  virtual ~AdminHandler() {}
+  virtual ~AdminHandler();
 
   void async_tm_ping(
       std::unique_ptr<apache::thrift::HandlerCallback<void>> callback) override;
@@ -183,6 +184,8 @@ class AdminHandler : virtual public AdminSvIf {
                       std::unique_ptr<rocksdb::Env> env_holder,
                       const bool enable_backup_rate_limit,
                       const uint32_t backup_rate_limit,
+                      const bool share_files_with_checksum,
+                      const bool include_meta,
                       AdminException* e);
 
   bool restoreDBHelper(const std::string& db_name,
@@ -195,6 +198,9 @@ class AdminHandler : virtual public AdminSvIf {
 
   std::shared_ptr<common::S3Util> createLocalS3Util(const uint32_t read_ratelimit_mb = 50,
                                                     const std::string& bucket = "");
+
+  std::unique_ptr<std::thread> db_deletion_thread_;
+  std::atomic<bool> stop_db_deletion_thread_;
 };
 
 }  // namespace admin

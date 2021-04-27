@@ -28,10 +28,16 @@ public class DedupTaskFactory implements TaskFactory {
 
   private final String cluster;
   private final int adminPort;
+  private final boolean useS3Store;
+  private final String s3Bucket;
 
-  public DedupTaskFactory(String cluster, int adminPort) {
+  private static final int DEFAULT_BACKUP_LIMIT_MBS = 64;
+
+  public DedupTaskFactory(String cluster, int adminPort, boolean useS3Store, String s3Bucket) {
     this.cluster = cluster;
     this.adminPort = adminPort;
+    this.useS3Store = useS3Store;
+    this.s3Bucket = s3Bucket;
   }
 
   /**
@@ -45,11 +51,11 @@ public class DedupTaskFactory implements TaskFactory {
     JobConfig jobConfig = context.getJobConfig();
     String job = jobConfig.getJobId();
 
-    LOG.error("Create task with TaskConfig: " + taskConfig.toString());
-
     String srcStorePathPrefix = "";
     long resourceVersion = -1;
     String destStorePathPrefix = "";
+    int backupLimitMbs = DEFAULT_BACKUP_LIMIT_MBS;
+    boolean shareFilesWithChecksum = true;
 
     try {
       Map<String, String> jobCmdMap = jobConfig.getJobCommandConfigMap();
@@ -63,6 +69,13 @@ public class DedupTaskFactory implements TaskFactory {
         if (jobCmdMap.containsKey("DEST_STORE_PATH_PREFIX")) {
           destStorePathPrefix = jobCmdMap.get("DEST_STORE_PATH_PREFIX");
         }
+        if (jobCmdMap.containsKey("BACKUP_LIMIT_MBS")) {
+          backupLimitMbs = Integer.parseInt(jobCmdMap.get("BACKUP_LIMIT_MBS"));
+        }
+        if (jobCmdMap.containsKey("ROCKSDB_SHARE_FILES_WITH_CHECKSUM")) {
+          shareFilesWithChecksum =
+              Boolean.parseBoolean(jobCmdMap.get("ROCKSDB_SHARE_FILES_WITH_CHECKSUM"));
+        }
       }
     } catch (NumberFormatException e) {
       LOG.error("Failed to parse resource_version from job command config map", e);
@@ -71,19 +84,23 @@ public class DedupTaskFactory implements TaskFactory {
     String targetPartition = taskConfig.getTargetPartition();
 
     LOG.error(String.format(
-        "Create Task for cluster: %s, targetPartition: %s from job: %s to execute at localhost, port:"
-            + " %d. {resourceVersion: %d, helixJobCreationTime: %d, taskCreationTime: %d}", cluster,
-        targetPartition, job, adminPort, resourceVersion, jobConfig.getStat().getCreationTime(),
-        System.currentTimeMillis()));
+        "Create Task for cluster: %s, targetPartition: %s from job: %s to execute at localhost, "
+            + "port: %d. {resourceVersion: %d, helixJobCreationTime: %d, taskCreationTime: %d, "
+            + "taskConfig: %s}", cluster, targetPartition, job, adminPort, resourceVersion,
+        jobConfig.getStat().getCreationTime(), System.currentTimeMillis(), taskConfig.toString()));
 
     return getTask(srcStorePathPrefix, resourceVersion, targetPartition, cluster, job, adminPort,
-        destStorePathPrefix);
+        destStorePathPrefix, useS3Store, s3Bucket, backupLimitMbs, shareFilesWithChecksum,
+        taskConfig);
   }
 
   protected DedupTask getTask(String srcStorePathPrefix, long resourceVersion, String partitionName,
-                              String cluster, String job, int port, String destStorePathPrefix) {
+                              String cluster, String job, int port, String destStorePathPrefix,
+                              boolean useS3Store, String s3Bucket, int backupLimitMbs,
+                              boolean shareFilesWithChecksum, TaskConfig taskConfig) {
     return new DedupTask(srcStorePathPrefix, resourceVersion, partitionName, cluster, job, port,
-        destStorePathPrefix);
+        destStorePathPrefix, useS3Store, s3Bucket, backupLimitMbs, shareFilesWithChecksum,
+        taskConfig);
   }
 
 }
